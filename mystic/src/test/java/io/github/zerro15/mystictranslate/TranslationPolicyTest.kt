@@ -33,6 +33,14 @@ class TranslationPolicyTest {
     }
 
     @Test
+    fun namesMatchWhenOcrDropsOrChangesMiddleDot() {
+        val terms = parseTerms("克莱恩 = Клейн\n克莱恩·莫雷蒂 = Клейн Моретти")
+        for (name in listOf("克莱恩莫雷蒂", "克莱恩 莫雷蒂", "克莱恩・莫雷蒂")) {
+            assertEquals(listOf(Segment("Клейн Моретти", true)), segments(name, terms))
+        }
+    }
+
+    @Test
     fun identicalHashDoesNotCollapseDistinctTranslationsAndLruEvictsColdEntry() {
         val cache = TranslationCache<String>(2)
         assertEquals("Aa".hashCode(), "BB".hashCode())
