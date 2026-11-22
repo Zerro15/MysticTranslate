@@ -1,6 +1,8 @@
 package io.github.zerro15.mystictranslate
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionConfig
@@ -47,8 +49,9 @@ class MainActivity : ComponentActivity() {
                 val start = Intent(this, CaptureService::class.java).putExtra(CaptureService.EXTRA_DATA, grant)
                 ContextCompat.startForegroundService(this, start)
                 feedback = ""
-            } catch (_: RuntimeException) {
+            } catch (error: RuntimeException) {
                 feedback = "Не удалось запустить захват. Повторите разрешение из приложения"
+                Diagnostics.failure("Запуск", feedback, error)
             }
         }
     }
@@ -66,17 +69,18 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         enableEdgeToEdge()
         Settings.initialize(this)
+        lifecycleScope.launch { Diagnostics.refreshModels() }
         setContent { MysticScreen() }
     }
 
-    override fun onStart() {
-        super.onStart()
+    override fun onResume() {
+        super.onResume()
         Settings.activityVisible.value = true
     }
 
-    override fun onStop() {
+    override fun onPause() {
         Settings.activityVisible.value = false
-        super.onStop()
+        super.onPause()
     }
 
     private fun begin() {
@@ -115,11 +119,13 @@ class MainActivity : ComponentActivity() {
             val client = translator()
             try {
                 client.downloadModelIfNeeded().await()
+                Diagnostics.refreshModels()
                 feedback = "Офлайн-модели готовы"
             } catch (error: CancellationException) {
                 throw error
-            } catch (_: Exception) {
+            } catch (error: Exception) {
                 feedback = "Не удалось загрузить модели. Проверьте интернет и повторите"
+                Diagnostics.failure("Модели", feedback, error)
             } finally {
                 client.close()
                 loadingModel = false
@@ -145,8 +151,8 @@ class MainActivity : ComponentActivity() {
         )) {
             Scaffold(topBar = { TopAppBar(title = { Text("MysticTranslate") }) }) { inset ->
                 Column(Modifier.padding(inset)) {
-                    TabRow(selectedTabIndex = page) {
-                        listOf("Перевод", "Словарь", "История").forEachIndexed { index, label ->
+                    ScrollableTabRow(selectedTabIndex = page, edgePadding = 0.dp) {
+                        listOf("Перевод", "Словарь", "История", "Диагностика").forEachIndexed { index, label ->
                             Tab(selected = page == index, onClick = { page = index }, text = { Text(label) })
                         }
                     }
@@ -176,9 +182,9 @@ class MainActivity : ComponentActivity() {
                                     Text("Область перевода", style = MaterialTheme.typography.titleLarge)
                                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                         FilterChip(options.dialogue, { save(options.copy(dialogue = true)) },
-                                            { Text("Диалоги внизу") })
+                                            { Text("Сюжет") })
                                         FilterChip(!options.dialogue, { save(options.copy(dialogue = false)) },
-                                            { Text("Весь экран") })
+                                            { Text("Полный экран") })
                                     }
                                     SettingSwitch("Повышенная детализация OCR", options.detailed) {
                                         save(options.copy(detailed = it))
@@ -194,7 +200,8 @@ class MainActivity : ComponentActivity() {
                                     NetworkSettings(options, ::save)
                                 }
                                 1 -> GlossarySettings(options, ::save)
-                                else -> HistoryPage(history)
+                                2 -> HistoryPage(history)
+                                else -> DiagnosticsPage()
                             }
                         }
                     }
@@ -291,6 +298,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun HistoryPage(history: List<Dialogue>) {
         var clear by remember { mutableStateOf(false) }
+        var selected by remember { mutableStateOf<Dialogue?>(null) }
         Text("Последние диалоги", style = MaterialTheme.typography.headlineSmall)
         if (history.isEmpty()) Text("Здесь появятся переведённые реплики из нижней области экрана.")
         if (history.isNotEmpty()) TextButton(onClick = { clear = true }) { Text("Очистить историю") }
@@ -299,6 +307,7 @@ class MainActivity : ComponentActivity() {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text(entry.russian, style = MaterialTheme.typography.bodyLarge)
                     Text(entry.source, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    TextButton(onClick = { selected = entry }) { Text("Исправить перевод") }
                 }
             }
         }
@@ -311,6 +320,60 @@ class MainActivity : ComponentActivity() {
                 }
             },
             dismissButton = { TextButton(onClick = { clear = false }) { Text("Отмена") } },
+        )
+        selected?.let { entry -> CorrectionDialog(entry) { selected = null } }
+    }
+
+    @Composable
+    private fun DiagnosticsPage() {
+        val data by Diagnostics.state.collectAsState()
+        var selected by remember { mutableStateOf<Dialogue?>(null) }
+        Text("Диагностика", style = MaterialTheme.typography.headlineSmall)
+        Text(if (data.active) "Захват включён" else "Захват выключен")
+        Text(data.message)
+        Text("Кадры · ${data.frameCount} · ${data.width}×${data.height}")
+        Text("Китайских блоков · ${data.chineseBlocks}")
+        Text("OCR · ${data.ocrMs ?: "—"} мс   Перевод · ${data.translateMs ?: "—"} мс")
+        Text("Офлайн-модели · ${data.models.label}")
+        if (data.lastSource.isNotEmpty()) {
+            Text("Последний распознанный текст", style = MaterialTheme.typography.titleMedium)
+            Text(data.lastSource)
+        }
+        data.lastTranslation?.let { entry ->
+            Text("Последний перевод", style = MaterialTheme.typography.titleMedium)
+            Text(entry.russian)
+            TextButton(onClick = { selected = entry }) { Text("Исправить перевод") }
+        }
+        Text("Последние ошибки", style = MaterialTheme.typography.titleMedium)
+        if (data.errors.isEmpty()) Text("Ошибок за сеанс нет")
+        data.errors.forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+        OutlinedButton(onClick = {
+            getSystemService(ClipboardManager::class.java).setPrimaryClip(
+                ClipData.newPlainText("Диагностика MysticTranslate", data.report()),
+            )
+        }) { Text("Копировать отчёт") }
+        selected?.let { entry -> CorrectionDialog(entry) { selected = null } }
+    }
+
+    @Composable
+    private fun CorrectionDialog(entry: Dialogue, close: () -> Unit) {
+        var russian by remember(entry) { mutableStateOf(entry.russian) }
+        AlertDialog(
+            onDismissRequest = close,
+            title = { Text("Исправить перевод") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(entry.source.take(300))
+                    OutlinedTextField(russian, { russian = it.take(2000) }, label = { Text("Перевод") })
+                }
+            },
+            confirmButton = {
+                TextButton(enabled = russian.isNotBlank(), onClick = {
+                    Settings.correct(this@MainActivity, entry.source, russian)
+                    close()
+                }) { Text("Сохранить") }
+            },
+            dismissButton = { TextButton(onClick = close) { Text("Отмена") } },
         )
     }
 }

@@ -6,7 +6,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 internal data class Options(
-    val dialogue: Boolean = true,
+    val dialogue: Boolean = false,
     val interval: Float = 1.8f,
     val detailed: Boolean = false,
     val font: Float = 17f,
@@ -25,6 +25,7 @@ internal data class Dialogue(val source: String, val russian: String)
 internal object Settings {
     private val options = MutableStateFlow(Options())
     private val history = MutableStateFlow<List<Dialogue>>(emptyList())
+    val corrections = MutableStateFlow<Map<String, String>>(emptyMap())
     val current get() = options
     val dialogues get() = history
     val activityVisible = MutableStateFlow(false)
@@ -37,7 +38,7 @@ internal object Settings {
         if (initialized) return
         val prefs = context.getSharedPreferences("mystic", Context.MODE_PRIVATE)
         options.value = Options(
-            dialogue = prefs.getBoolean("dialogue", true),
+            dialogue = prefs.getBoolean("dialogue", false),
             interval = prefs.getFloat("interval", 1.8f),
             detailed = prefs.getBoolean("detailed", false),
             font = prefs.getFloat("font", 17f),
@@ -56,6 +57,12 @@ internal object Settings {
                 Dialogue(entry.getString("source"), entry.getString("russian"))
             }
         }.getOrDefault(emptyList())
+        corrections.value = runCatching {
+            val saved = JSONObject(prefs.getString("corrections", "{}").orEmpty())
+            saved.keys().asSequence().take(120).associateWith(saved::getString)
+        }.onFailure {
+            Diagnostics.failure("Исправления", "Не удалось прочитать исправления", it)
+        }.getOrDefault(emptyMap())
         initialized = true
     }
 
@@ -75,6 +82,17 @@ internal object Settings {
     }
 
     fun clearHistory(context: Context) = setHistory(context, emptyList())
+
+    fun correct(context: Context, source: String, russian: String) {
+        val key = normalizeRecognition(source)
+        require(key.isNotBlank() && russian.isNotBlank())
+        val values = (listOf(key to russian.trim()) + corrections.value.toList().filterNot { it.first == key })
+            .take(120).toMap()
+        corrections.value = values
+        context.getSharedPreferences("mystic", Context.MODE_PRIVATE).edit()
+            .putString("corrections", JSONObject(values).toString()).apply()
+        setHistory(context, history.value.map { if (it.source == key) it.copy(russian = values.getValue(key)) else it })
+    }
 
     private fun setHistory(context: Context, entries: List<Dialogue>) {
         history.value = entries.take(40)

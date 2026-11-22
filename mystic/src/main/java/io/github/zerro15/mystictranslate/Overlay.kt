@@ -7,22 +7,16 @@ import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.RectF
-import android.os.Handler
-import android.os.Looper
+import android.hardware.input.InputManager
 import android.os.Build
 import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
 import android.view.Gravity
-import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
-import android.view.ViewConfiguration
 import android.view.WindowManager
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.TextView
 import kotlin.math.max
 import kotlin.math.min
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -32,6 +26,9 @@ internal data class OverlayBlock(val text: String, val bounds: Rect)
 /** Окна поверх игры, с проходом касаний во время перевода. */
 internal class Overlay(context: Context, stop: () -> Unit) : AutoCloseable {
     private val wm = context.getSystemService(WindowManager::class.java)
+    private val touchAlpha = if (Build.VERSION.SDK_INT >= 31) {
+        context.getSystemService(InputManager::class.java).maximumObscuringOpacityForTouch
+    } else 0.8f
     private val board = Board(context)
     private val boardLayout = WindowManager.LayoutParams(
         -1, -1, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -43,164 +40,38 @@ internal class Overlay(context: Context, stop: () -> Unit) : AutoCloseable {
         if (Build.VERSION.SDK_INT >= 30) {
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         }
-        alpha = 0.72f
+        alpha = minOf(0.72f, touchAlpha)
     }
-    private val density = context.resources.displayMetrics.density
-    private fun dp(value: Int) = (value * density).toInt()
-    private val dragHandler = Handler(Looper.getMainLooper())
-    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
-    private val controlParams = WindowManager.LayoutParams(
-        -2, -2, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT,
-    ).apply {
-        gravity = Gravity.TOP or Gravity.END
-        x = dp(8)
-        y = dp(12)
-    }
-    private var editing = false
     val editMode = MutableStateFlow(false)
-    private val feedback = TextView(context).apply {
-        text = "Ищу китайский текст…"
-        textSize = 10f
-        setTextColor(Color.WHITE)
-        setBackgroundColor(0xcc20202a.toInt())
-        setPadding(dp(6), dp(3), dp(6), dp(3))
-    }
-    private val controls = LinearLayout(context).apply {
-        orientation = LinearLayout.VERTICAL
-        val actions = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(Button(context).apply {
-                text = "Блоки"
-                textSize = 12f
-                isAllCaps = false
-                minHeight = 0
-                minimumHeight = 0
-                minWidth = 0
-                minimumWidth = 0
-                setPadding(dp(10), 0, dp(10), 0)
-                layoutParams = LinearLayout.LayoutParams(-2, dp(36))
-                setOnClickListener {
-                    editing = !editing
-                    text = if (editing) "Готово" else "Блоки"
-                    boardLayout.flags = if (editing) {
-                        boardLayout.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-                    } else {
-                        boardLayout.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                    }
-                    wm.updateViewLayout(board, boardLayout)
-                    board.editing = editing
-                    editMode.value = editing
-                    showStatus(if (editing) "Редактирование: нажмите Готово" else "Ищу китайский текст…")
-                    board.invalidate()
-                }
-                enableDrag(this)
-            })
-            addView(Button(context).apply {
-                text = "Стоп"
-                textSize = 12f
-                isAllCaps = false
-                minHeight = 0
-                minimumHeight = 0
-                minWidth = 0
-                minimumWidth = 0
-                setPadding(dp(10), 0, dp(10), 0)
-                layoutParams = LinearLayout.LayoutParams(-2, dp(36))
-                contentDescription = "Остановить перевод и захват экрана"
-                setOnClickListener { stop() }
-                enableDrag(this)
-            })
-        }
-        addView(actions)
-        addView(feedback)
-    }
+    private val controls = FloatingControls(context, wm, ::toggleEditing, stop)
 
-    /** Короткое касание нажимает кнопку, удержание с последующим движением перемещает панель. */
-    private fun enableDrag(button: Button) {
-        var downX = 0f
-        var downY = 0f
-        var startX = 0
-        var startY = 0
-        var moving = false
-        var cancelledTap = false
-        var pending: Runnable? = null
-        button.setOnTouchListener { view, event ->
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    downX = event.rawX
-                    downY = event.rawY
-                    moving = false
-                    cancelledTap = false
-                    pending?.let(dragHandler::removeCallbacks)
-                    pending = Runnable {
-                        moving = true
-                        val location = IntArray(2)
-                        controls.getLocationOnScreen(location)
-                        controlParams.gravity = Gravity.TOP or Gravity.LEFT
-                        controlParams.x = location[0]
-                        controlParams.y = location[1]
-                        startX = controlParams.x
-                        startY = controlParams.y
-                        view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                    }.also {
-                        dragHandler.postDelayed(it, ViewConfiguration.getLongPressTimeout().toLong())
-                    }
-                    view.isPressed = true
-                    true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val deltaX = event.rawX - downX
-                    val deltaY = event.rawY - downY
-                    if (moving) {
-                        val metrics = board.resources.displayMetrics
-                        controlParams.x = (startX + deltaX.toInt())
-                            .coerceIn(0, (metrics.widthPixels - controls.width).coerceAtLeast(0))
-                        controlParams.y = (startY + deltaY.toInt())
-                            .coerceIn(0, (metrics.heightPixels - controls.height).coerceAtLeast(0))
-                        wm.updateViewLayout(controls, controlParams)
-                        view.isPressed = false
-                    } else if (kotlin.math.abs(deltaX) > touchSlop ||
-                        kotlin.math.abs(deltaY) > touchSlop
-                    ) {
-                        cancelledTap = true
-                        pending?.let(dragHandler::removeCallbacks)
-                        view.isPressed = false
-                    }
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    pending?.let(dragHandler::removeCallbacks)
-                    view.isPressed = false
-                    if (!moving && !cancelledTap) view.performClick()
-                    moving = false
-                    true
-                }
-                MotionEvent.ACTION_CANCEL -> {
-                    pending?.let(dragHandler::removeCallbacks)
-                    view.isPressed = false
-                    moving = false
-                    true
-                }
-                else -> true
-            }
-        }
+    private fun toggleEditing() {
+        val editing = !editMode.value
+        boardLayout.flags = if (editing) boardLayout.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+            else boardLayout.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        wm.updateViewLayout(board, boardLayout)
+        board.editing = editing
+        controls.setEditing(editing)
+        showStatus(if (editing) "Редактирование блоков" else "Возобновляю перевод")
+        editMode.value = editing
+        board.invalidate()
     }
 
     fun attach() {
         wm.addView(board, boardLayout)
-        wm.addView(controls, controlParams)
+        controls.attach()
     }
 
-    fun showStatus(message: String?) {
-        feedback.visibility = if (message == null) View.GONE else View.VISIBLE
-        if (message != null && feedback.text.toString() != message) feedback.text = message
-    }
+    fun showStatus(message: String?) = controls.showStatus(message)
+
+    fun updateGeometry() = controls.reposition()
 
     fun setBlocks(blocks: List<OverlayBlock>, font: Float, opacity: Float) {
         board.blocks = blocks
         board.font = font
-        if (boardLayout.alpha != opacity) {
-            boardLayout.alpha = opacity.coerceIn(0.2f, 0.8f)
+        val safeOpacity = minOf(opacity.coerceIn(0.2f, 0.8f), touchAlpha)
+        if (boardLayout.alpha != safeOpacity) {
+            boardLayout.alpha = safeOpacity
             wm.updateViewLayout(board, boardLayout)
         }
         board.invalidate()
@@ -219,13 +90,16 @@ internal class Overlay(context: Context, stop: () -> Unit) : AutoCloseable {
     }
 
     fun setReadingScreen(reading: Boolean) {
-        controls.visibility = if (reading) View.VISIBLE else View.INVISIBLE
+        controls.setVisible(reading)
         hideForCapture(!reading)
     }
 
     override fun close() {
-        if (controls.isAttachedToWindow) wm.removeViewImmediate(controls)
-        if (board.isAttachedToWindow) wm.removeViewImmediate(board)
+        try {
+            controls.close()
+        } finally {
+            if (board.isAttachedToWindow) wm.removeViewImmediate(board)
+        }
     }
 
     private class Board(context: Context) : View(context) {

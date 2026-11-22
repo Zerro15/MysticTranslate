@@ -8,7 +8,6 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
-import android.graphics.Bitmap
 import android.graphics.Rect
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -17,7 +16,6 @@ import android.provider.Settings as AndroidSettings
 import android.view.WindowManager
 import androidx.core.app.ServiceCompat
 import androidx.core.content.IntentCompat
-import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -75,7 +73,10 @@ class CaptureService : Service() {
             Settings.initialize(this)
             val projectionManager = getSystemService(MediaProjectionManager::class.java)
             val projection = checkNotNull(projectionManager.getMediaProjection(android.app.Activity.RESULT_OK, data))
-            val surface = ProjectionFrames(this, projection, { stopSelf() }, { overlay?.clear() })
+            val surface = ProjectionFrames(this, projection, { stopSelf() }, {
+                overlay?.clear()
+                overlay?.updateGeometry()
+            })
             frames = surface
             val dimensions = screenBounds()
             surface.start(dimensions.width(), dimensions.height())
@@ -84,17 +85,21 @@ class CaptureService : Service() {
             windows.attach()
             val pipeline = Engines()
             engines = pipeline
+            Diagnostics.start(dimensions.width(), dimensions.height())
+            scope.launch { Diagnostics.refreshModels() }
             status.value = CaptureStatus(true, "Захват включён. Откройте игру")
             scope.launch {
                 combine(Settings.current, Settings.activityVisible, windows.editMode, ::Triple).collectLatest { (options, visible, editing) ->
                     windows.setReadingScreen(!visible)
                     if (!visible && !editing) runLoop(surface, windows, pipeline, options)
+                    else Diagnostics.status(if (editing) "Редактирование блоков" else "Пауза в настройках")
                 }
             }
         } catch (error: CancellationException) {
             throw error
-        } catch (_: RuntimeException) {
+        } catch (error: RuntimeException) {
             endMessage = "Не удалось запустить захват. Откройте приложение и разрешите захват снова"
+            Diagnostics.failure("Запуск", endMessage, error)
             stopSelf()
         }
     }
@@ -104,85 +109,130 @@ class CaptureService : Service() {
     )
 
     private suspend fun runLoop(
-        surface: ProjectionFrames, windows: Overlay, pipeline: Engines, options: Options
+        surface: ProjectionFrames, windows: Overlay, pipeline: Engines, options: Options,
     ) {
         windows.clear()
         val terms = if (options.profile) parseTerms(options.glossary) else emptyList()
+        val analyzer = FrameAnalyzer(pipeline, options)
         var displayed: Dialogue? = null
-        var previous: Pair<Int, List<Recognized>>? = null
-        var missingFrames = 0
+        var missing = 0
+        var failures = 0
+        var mismatch = 0
+        displayStatus(windows, "Жду кадр")
         while (currentCoroutineContext().isActive) {
             if (!AndroidSettings.canDrawOverlays(this)) {
                 endMessage = "Разрешение на наложение отозвано"
+                Diagnostics.failure("Наложение", endMessage)
                 stopSelf()
                 return
             }
             try {
                 val generation = surface.generation
                 val masked = windows.hasBlocks
-                if (masked) windows.hideForCapture(true)
+                if (masked) {
+                    surface.discardQueued()
+                    windows.hideForCapture(true)
+                }
                 val bitmap = try {
                     surface.capture(masked)
                 } finally {
                     if (masked) windows.hideForCapture(false)
                 }
-                val recognized = if (bitmap != null) recognizeFrame(bitmap, pipeline, options) else null
-                missingFrames = if (bitmap == null) missingFrames + 1 else 0
-                if (recognized != null) previous = generation to recognized
-                // При статичной сцене VirtualDisplay может повторно не отдавать кадр.
-                val blocks = recognized ?: previous?.takeIf {
-                    options.dialogue && !masked && it.first == generation
-                }?.second
-                if (blocks != null && generation == surface.generation) {
-                    if (blocks.isEmpty()) {
-                        windows.clear()
-                        windows.showStatus("Китайский текст не распознан")
-                        displayed = null
-                        status.value = CaptureStatus(true, "Китайский текст не распознан")
-                    } else {
-                        // Не ждём двух одинаковых OCR-кадров: игровые шрифты и анимация
-                        // приводили к бесконечному ожиданию и отсутствию перевода.
-                        val text = if (options.dialogue) {
-                            normalized(blocks.joinToString(" ") { it.text })
-                        } else ""
-                        val history = Settings.dialogues.value.dropWhile { it.source == text }
-                        val rendered = blocks.map { block ->
-                            val source = normalized(block.text)
-                            val prior = displayed?.takeIf { it.source == source }
-                            val russian = prior?.russian ?: pipeline.translate(source, options, terms, history)
-                            OverlayBlock(russian, block.bounds)
+                if (bitmap == null) {
+                    missing++
+                    if (missing == 2 && Diagnostics.state.value.frameCount == 0L) {
+                        Diagnostics.failure("Кадры", "Нет кадров. Выберите весь экран")
+                        displayStatus(windows, "Нет кадров · весь экран")
+                    } else if (missing == 3) {
+                        displayStatus(windows, "Жду обновления кадра")
+                    }
+                } else {
+                    missing = 0
+                    val width = bitmap.width
+                    val height = bitmap.height
+                    Diagnostics.frame(width, height)
+                    val target = screenBounds()
+                    val renderedAspect = width.toFloat() / height
+                    val screenAspect = target.width().toFloat() / target.height()
+                    val result = try {
+                        if (kotlin.math.abs(renderedAspect / screenAspect - 1f) > 0.12f) {
+                            mismatch++
+                            if (mismatch == 2) {
+                                windows.clear()
+                                Diagnostics.failure("Область", "Размер захвата не совпадает с экраном. Выберите весь экран")
+                                displayStatus(windows, "Выберите весь экран")
+                            }
+                            null
+                        } else {
+                            mismatch = 0
+                            analyzer.read(bitmap, generation)
                         }
-                        if (generation == surface.generation) {
-                            windows.setBlocks(rendered, options.font, options.opacity)
-                            windows.showStatus(null)
-                            if (options.dialogue && text.isNotBlank() &&
-                                text != displayed?.source && rendered.size == 1
-                            ) {
-                                val dialogue = Dialogue(text, rendered.single().text)
-                                Settings.record(this, dialogue)
-                                displayed = dialogue
+                    } finally {
+                        bitmap.recycle()
+                    }
+                    if (generation == surface.generation && result != null) {
+                        Diagnostics.recognition(result.blocks, result.ocrMs)
+                        if (result.blocks.isEmpty()) {
+                            displayed = null
+                            windows.clear()
+                            val message = if (result.uniform) "Пустой кадр · проверьте захват" else "Китайский текст не найден"
+                            displayStatus(windows, message)
+                        } else {
+                            val basis = PixelBox(target.left, target.top, target.right, target.bottom)
+                            val context = Settings.dialogues.value
+                            val rendered = ArrayList<OverlayBlock>(result.blocks.size)
+                            var errorSeen = false
+                            var passage: Dialogue? = null
+                            for (block in result.blocks) {
+                                val source = block.text
+                                val start = android.os.SystemClock.elapsedRealtime()
+                                val russian = try {
+                                    Settings.corrections.value[source]
+                                        ?: displayed?.takeIf { it.source == source }?.russian
+                                        ?: pipeline.translate(source, options, terms, context.dropWhile { it.source == source })
+                                } catch (error: EngineFailure) {
+                                    if (!errorSeen) describeFailure(windows, error)
+                                    errorSeen = true
+                                    if (error.stage == Stage.OFFLINE && Diagnostics.state.value.models == ModelState.MISSING) break
+                                    continue
+                                }
+                                if (generation != surface.generation) break
+                                val rect = block.bounds
+                                val placement = sourceBounds(PixelBox(rect.left, rect.top, rect.right, rect.bottom), basis, width, height)
+                                    ?: continue
+                                rendered += OverlayBlock(russian, Rect(placement.left, placement.top, placement.right, placement.bottom))
+                                if (rendered.size == 1 || rendered.size % 8 == 0) {
+                                    windows.setBlocks(rendered.toList(), options.font, options.opacity)
+                                }
+                                passage = Dialogue(source, russian)
+                                Diagnostics.translated(source, russian, android.os.SystemClock.elapsedRealtime() - start)
+                            }
+                            if (generation == surface.generation) {
+                                windows.setBlocks(rendered, options.font, options.opacity)
+                                if (options.dialogue && passage != null && displayed != passage) {
+                                    Settings.record(this, passage)
+                                    displayed = passage
+                                }
+                                if (errorSeen) {
+                                    failures++
+                                    if (failures <= 2) analyzer.reset()
+                                    delay(if (options.cloud && options.dialogue) 8_000L else 2_200L)
+                                } else {
+                                    failures = 0
+                                    displayStatus(windows, "Перевод · ${rendered.size}")
+                                }
                             }
                         }
-                        status.value = CaptureStatus(true, "Захват и перевод работают")
                     }
-                } else if (missingFrames >= 4 && !windows.hasBlocks) {
-                    windows.showStatus("Нет кадров. Проверьте разрешение захвата")
-                    status.value = CaptureStatus(true, "Нет кадров. Проверьте разрешение захвата")
                 }
-            } catch (error: CancellationException) {
-                throw error
+            } catch (cancel: CancellationException) {
+                throw cancel
             } catch (error: EngineFailure) {
-                windows.clear()
-                val message = when (error.stage) {
-                    Stage.OCR -> "Ошибка OCR. Проверьте выбранный движок"
-                    Stage.OFFLINE -> "Ошибка перевода. Загрузите офлайн-модели в MysticTranslate"
-                    Stage.CLOUD -> "Облачный перевод недоступен. Проверьте адрес, модель и ключ"
-                }
-                status.value = CaptureStatus(true, message)
-                windows.showStatus(message)
-                delay(if (error.stage == Stage.CLOUD) 8_000 else 2_000)
-            } catch (_: RuntimeException) {
-                endMessage = "Захват прерван. Запустите его снова из MysticTranslate"
+                describeFailure(windows, error)
+                delay(2200)
+            } catch (error: RuntimeException) {
+                endMessage = "Захват прерван. Запустите его снова"
+                Diagnostics.failure("Захват", endMessage, error)
                 stopSelf()
                 return
             }
@@ -190,32 +240,22 @@ class CaptureService : Service() {
         }
     }
 
-    private suspend fun recognizeFrame(bitmap: Bitmap, pipeline: Engines, options: Options): List<Recognized> {
-        val top = if (options.dialogue) (bitmap.height * 0.58f).roundToInt() else 0
-        val crop = Bitmap.createBitmap(bitmap, 0, top, bitmap.width, bitmap.height - top)
-        val limit = if (options.detailed) 2560 else 1440
-        val factor = (limit.toFloat() / maxOf(crop.width, crop.height)).coerceAtMost(1f)
-        val scaled = if (factor == 1f) crop else Bitmap.createScaledBitmap(
-            crop, (crop.width * factor).roundToInt().coerceAtLeast(1),
-            (crop.height * factor).roundToInt().coerceAtLeast(1), true,
-        )
-        if (crop !== bitmap && crop !== scaled) crop.recycle()
-        if (bitmap !== scaled) bitmap.recycle()
-        // ML Kit может дочитать bitmap после отмены ожидания; в этом случае память освободит GC.
-        val recognized = pipeline.recognize(scaled, options)
-        val blocks = recognized.filter { han.containsMatchIn(it.text) && !it.bounds.isEmpty }
-            .map { block ->
-                val bounds = block.bounds
-                Recognized(block.text, Rect(
-                    (bounds.left / factor).roundToInt(), (bounds.top / factor).roundToInt() + top,
-                    (bounds.right / factor).roundToInt(), (bounds.bottom / factor).roundToInt() + top,
-                ))
-            }.sortedWith(compareBy({ it.bounds.top }, { it.bounds.left })).take(50)
-        scaled.recycle()
-        if (!options.dialogue || blocks.isEmpty()) return blocks
-        val bounds = Rect(blocks.first().bounds)
-        blocks.drop(1).forEach { bounds.union(it.bounds) }
-        return listOf(Recognized(blocks.joinToString(" ") { it.text }, bounds))
+    private fun describeFailure(windows: Overlay, error: EngineFailure) {
+        val message = when (error.stage) {
+            Stage.OCR -> "Ошибка OCR · проверьте движок"
+            Stage.OFFLINE -> if (Diagnostics.state.value.models == ModelState.MISSING) {
+                "Загрузите офлайн-модели"
+            } else "Ошибка локального перевода"
+            Stage.CLOUD -> "Ошибка API · проверьте настройки"
+        }
+        Diagnostics.failure(error.stage.name, message, error)
+        displayStatus(windows, message)
+    }
+
+    private fun displayStatus(windows: Overlay, message: String) {
+        Diagnostics.status(message)
+        status.value = CaptureStatus(true, message)
+        windows.showStatus(message)
     }
 
     @Suppress("DEPRECATION")
@@ -229,6 +269,7 @@ class CaptureService : Service() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        overlay?.updateGeometry()
         if (Build.VERSION.SDK_INT < 34) {
             val bounds = screenBounds()
             frames?.resize(bounds.width(), bounds.height())
@@ -254,10 +295,11 @@ class CaptureService : Service() {
     override fun onDestroy() {
         scope.cancel()
         frames?.close()
-        runCatching { overlay?.close() }
-        runCatching { engines?.close() }
+        runCatching { overlay?.close() }.onFailure { Diagnostics.failure("Наложение", "Не удалось закрыть оверлей", it) }
+        runCatching { engines?.close() }.onFailure { Diagnostics.failure("OCR", "Не удалось закрыть движок", it) }
         stopForeground(STOP_FOREGROUND_REMOVE)
         status.value = CaptureStatus(false, endMessage)
+        Diagnostics.status(endMessage, active = false)
         super.onDestroy()
     }
 
