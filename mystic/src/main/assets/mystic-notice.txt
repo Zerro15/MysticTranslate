@@ -1,0 +1,14 @@
+MysticTranslate is a modified fork of Screen Translator (overlay-translator).
+Copyright 2026 ciddwd for upstream work.
+Original copyright and attribution are retained in LICENSE and NOTICE.
+
+The upstream NOTICE describes the broader Screen Translator APK. The MysticTranslate
+APK includes AndroidX / Compose, Kotlin and coroutines, OkHttp / Okio, and Google
+ML Kit Chinese Text Recognition and Translation with their transitive dependencies.
+It does not include the upstream native LLM, speech stack or model assets.
+Google ML Kit is governed by its own terms: https://developers.google.com/ml-kit/terms
+Images and text used by on-device ML Kit are processed locally. As documented by
+Google, the SDK may still download models and collect performance or usage metrics.
+
+The Umi-OCR protocol adapter requires a separately hosted service; no Umi-OCR server
+is distributed in this APK. No OpenAI-compatible provider credentials are bundled.
