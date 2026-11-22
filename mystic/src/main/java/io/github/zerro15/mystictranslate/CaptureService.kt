@@ -108,9 +108,9 @@ class CaptureService : Service() {
     ) {
         windows.clear()
         val terms = if (options.profile) parseTerms(options.glossary) else emptyList()
-        var candidate: String? = null
         var displayed: Dialogue? = null
         var previous: Pair<Int, List<Recognized>>? = null
+        var missingFrames = 0
         while (currentCoroutineContext().isActive) {
             if (!AndroidSettings.canDrawOverlays(this)) {
                 endMessage = "Разрешение на наложение отозвано"
@@ -127,39 +127,47 @@ class CaptureService : Service() {
                     if (masked) windows.hideForCapture(false)
                 }
                 val recognized = if (bitmap != null) recognizeFrame(bitmap, pipeline, options) else null
+                missingFrames = if (bitmap == null) missingFrames + 1 else 0
                 if (recognized != null) previous = generation to recognized
-                // Статичный VirtualDisplay может не выдать второй кадр при пустом оверлее.
+                // При статичной сцене VirtualDisplay может повторно не отдавать кадр.
                 val blocks = recognized ?: previous?.takeIf {
                     options.dialogue && !masked && it.first == generation
                 }?.second
-                if (blocks != null) {
-                    if (generation == surface.generation) {
-                        val text = if (options.dialogue) normalized(blocks.joinToString(" ") { it.text }) else ""
-                        if (options.dialogue && text != candidate) {
-                            candidate = text
-                            windows.clear()
-                        } else {
-                            val history = Settings.dialogues.value.dropWhile { it.source == text }
-                            val rendered = blocks.map { block ->
-                                val source = normalized(block.text)
-                                val prior = displayed?.takeIf { it.source == source }
-                                val russian = prior?.russian ?: pipeline.translate(source, options, terms, history)
-                                OverlayBlock(russian, block.bounds)
-                            }
-                            if (generation == surface.generation) {
-                                windows.setBlocks(rendered, options.font, options.opacity)
-                                if (options.dialogue && text.isNotBlank() && text != displayed?.source && rendered.isNotEmpty()) {
-                                    val dialogue = Dialogue(text, rendered.single().text)
-                                    Settings.record(this, dialogue)
-                                    displayed = dialogue
-                                } else if (text.isBlank()) {
-                                    displayed = null
-                                }
+                if (blocks != null && generation == surface.generation) {
+                    if (blocks.isEmpty()) {
+                        windows.clear()
+                        windows.showStatus("Китайский текст не распознан")
+                        displayed = null
+                        status.value = CaptureStatus(true, "Китайский текст не распознан")
+                    } else {
+                        // Не ждём двух одинаковых OCR-кадров: игровые шрифты и анимация
+                        // приводили к бесконечному ожиданию и отсутствию перевода.
+                        val text = if (options.dialogue) {
+                            normalized(blocks.joinToString(" ") { it.text })
+                        } else ""
+                        val history = Settings.dialogues.value.dropWhile { it.source == text }
+                        val rendered = blocks.map { block ->
+                            val source = normalized(block.text)
+                            val prior = displayed?.takeIf { it.source == source }
+                            val russian = prior?.russian ?: pipeline.translate(source, options, terms, history)
+                            OverlayBlock(russian, block.bounds)
+                        }
+                        if (generation == surface.generation) {
+                            windows.setBlocks(rendered, options.font, options.opacity)
+                            windows.showStatus(null)
+                            if (options.dialogue && text.isNotBlank() &&
+                                text != displayed?.source && rendered.size == 1
+                            ) {
+                                val dialogue = Dialogue(text, rendered.single().text)
+                                Settings.record(this, dialogue)
+                                displayed = dialogue
                             }
                         }
+                        status.value = CaptureStatus(true, "Захват и перевод работают")
                     }
-                    status.value = CaptureStatus(true,
-                        if (blocks.isEmpty()) "Ищу китайские надписи" else "Захват и перевод работают")
+                } else if (missingFrames >= 4 && !windows.hasBlocks) {
+                    windows.showStatus("Нет кадров. Проверьте разрешение захвата")
+                    status.value = CaptureStatus(true, "Нет кадров. Проверьте разрешение захвата")
                 }
             } catch (error: CancellationException) {
                 throw error
@@ -171,6 +179,7 @@ class CaptureService : Service() {
                     Stage.CLOUD -> "Облачный перевод недоступен. Проверьте адрес, модель и ключ"
                 }
                 status.value = CaptureStatus(true, message)
+                windows.showStatus(message)
                 delay(if (error.stage == Stage.CLOUD) 8_000 else 2_000)
             } catch (_: RuntimeException) {
                 endMessage = "Захват прерван. Запустите его снова из MysticTranslate"
