@@ -15,7 +15,12 @@ import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import okhttp3.Call
@@ -38,7 +43,7 @@ internal fun translator() = Translation.getClient(
 )
 
 internal enum class Stage { OCR, OFFLINE, CLOUD }
-internal class EngineFailure(val stage: Stage) : Exception()
+internal class EngineFailure(val stage: Stage, cause: Throwable? = null) : Exception(cause)
 
 internal fun httpsEndpoint(raw: String, path: String): HttpUrl? {
     val base = raw.trim().toHttpUrlOrNull() ?: return null
@@ -61,14 +66,20 @@ internal class Engines : AutoCloseable {
     private val cache = TranslationCache<Key>()
 
     suspend fun recognize(bitmap: Bitmap, options: Options): List<Recognized> =
-        engineCall(Stage.OCR) {
+        ocrGate.withLock { engineCall(Stage.OCR) {
             if (options.umi) umiRecognize(bitmap, options.umiUrl) else {
-                recognizer.process(InputImage.fromBitmap(bitmap, 0)).await().textBlocks.mapNotNull {
+                currentCoroutineContext().ensureActive()
+                // ML Kit может продолжить читать Bitmap после отмены await().
+                val result = withContext(NonCancellable) {
+                    recognizer.process(InputImage.fromBitmap(bitmap, 0)).await()
+                }
+                currentCoroutineContext().ensureActive()
+                result.textBlocks.mapNotNull {
                     val box = it.boundingBox ?: return@mapNotNull null
                     Recognized(it.text, box)
                 }
             }
-        }
+        } }
 
     suspend fun translate(source: String, options: Options, terms: List<Term>, context: List<Dialogue>): String {
         val online = options.cloud && options.dialogue
@@ -88,7 +99,8 @@ internal class Engines : AutoCloseable {
 
     private suspend fun List<Segment>.joinTranslated(translate: suspend (String) -> String): String {
         val parts = map { segment ->
-            if (segment.isTerm || !han.containsMatchIn(segment.text)) segment.text else translate(segment.text)
+            if (segment.isTerm) segment.text else if (han.containsMatchIn(segment.text)) translate(segment.text)
+            else segment.text.replace('。', '.').replace('，', ',').replace('！', '!').replace('？', '?')
         }
         return buildString {
             parts.forEach { part ->
@@ -181,8 +193,8 @@ internal class Engines : AutoCloseable {
             action()
         } catch (error: kotlinx.coroutines.CancellationException) {
             throw error
-        } catch (_: Exception) {
-            throw EngineFailure(stage)
+        } catch (error: Exception) {
+            throw EngineFailure(stage, error)
         }
 
     override fun close() {
@@ -190,5 +202,9 @@ internal class Engines : AutoCloseable {
         local.close()
         http.dispatcher.cancelAll()
         http.connectionPool.evictAll()
+    }
+
+    private companion object {
+        val ocrGate = Mutex()
     }
 }

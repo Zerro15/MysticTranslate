@@ -7,6 +7,7 @@ import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.RectF
+import android.hardware.input.InputManager
 import android.os.Build
 import android.text.Layout
 import android.text.StaticLayout
@@ -16,8 +17,6 @@ import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.WindowManager
-import android.widget.Button
-import android.widget.LinearLayout
 import kotlin.math.max
 import kotlin.math.min
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -27,6 +26,9 @@ internal data class OverlayBlock(val text: String, val bounds: Rect)
 /** Окна поверх игры, с проходом касаний во время перевода. */
 internal class Overlay(context: Context, stop: () -> Unit) : AutoCloseable {
     private val wm = context.getSystemService(WindowManager::class.java)
+    private val touchAlpha = if (Build.VERSION.SDK_INT >= 31) {
+        context.getSystemService(InputManager::class.java).maximumObscuringOpacityForTouch
+    } else 0.8f
     private val board = Board(context)
     private val boardLayout = WindowManager.LayoutParams(
         -1, -1, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -38,49 +40,38 @@ internal class Overlay(context: Context, stop: () -> Unit) : AutoCloseable {
         if (Build.VERSION.SDK_INT >= 30) {
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         }
-        alpha = 0.72f
+        alpha = minOf(0.72f, touchAlpha)
     }
-    private var editing = false
     val editMode = MutableStateFlow(false)
-    private val controls = LinearLayout(context).apply {
-        orientation = LinearLayout.HORIZONTAL
-        addView(Button(context).apply {
-            text = "Блоки"
-            setOnClickListener {
-                editing = !editing
-                text = if (editing) "Готово" else "Блоки"
-                boardLayout.flags = if (editing) boardLayout.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-                    else boardLayout.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                wm.updateViewLayout(board, boardLayout)
-                board.editing = editing
-                editMode.value = editing
-                board.invalidate()
-            }
-            setOnLongClickListener {
-                board.reset()
-                true
-            }
-        })
-        addView(Button(context).apply {
-            text = "Стоп"
-            contentDescription = "Остановить перевод и захват экрана"
-            setOnClickListener { stop() }
-        })
+    private val controls = FloatingControls(context, wm, ::toggleEditing, stop)
+
+    private fun toggleEditing() {
+        val editing = !editMode.value
+        boardLayout.flags = if (editing) boardLayout.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+            else boardLayout.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        wm.updateViewLayout(board, boardLayout)
+        board.editing = editing
+        controls.setEditing(editing)
+        showStatus(if (editing) "Редактирование блоков" else "Возобновляю перевод")
+        editMode.value = editing
+        board.invalidate()
     }
 
     fun attach() {
         wm.addView(board, boardLayout)
-        wm.addView(controls, WindowManager.LayoutParams(
-            -2, -2, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT,
-        ).apply { gravity = Gravity.TOP or Gravity.END })
+        controls.attach()
     }
+
+    fun showStatus(message: String?) = controls.showStatus(message)
+
+    fun updateGeometry() = controls.reposition()
 
     fun setBlocks(blocks: List<OverlayBlock>, font: Float, opacity: Float) {
         board.blocks = blocks
         board.font = font
-        if (boardLayout.alpha != opacity) {
-            boardLayout.alpha = opacity.coerceIn(0.2f, 0.8f)
+        val safeOpacity = minOf(opacity.coerceIn(0.2f, 0.8f), touchAlpha)
+        if (boardLayout.alpha != safeOpacity) {
+            boardLayout.alpha = safeOpacity
             wm.updateViewLayout(board, boardLayout)
         }
         board.invalidate()
@@ -99,13 +90,16 @@ internal class Overlay(context: Context, stop: () -> Unit) : AutoCloseable {
     }
 
     fun setReadingScreen(reading: Boolean) {
-        controls.visibility = if (reading) View.VISIBLE else View.INVISIBLE
+        controls.setVisible(reading)
         hideForCapture(!reading)
     }
 
     override fun close() {
-        if (controls.isAttachedToWindow) wm.removeViewImmediate(controls)
-        if (board.isAttachedToWindow) wm.removeViewImmediate(board)
+        try {
+            controls.close()
+        } finally {
+            if (board.isAttachedToWindow) wm.removeViewImmediate(board)
+        }
     }
 
     private class Board(context: Context) : View(context) {

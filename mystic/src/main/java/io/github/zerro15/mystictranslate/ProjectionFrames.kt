@@ -12,6 +12,8 @@ import android.os.Handler
 import android.os.Looper
 import java.nio.ByteBuffer
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** Адаптировано из MediaProjectionScreenshotter, Copyright 2026 ciddwd, Apache-2.0. */
 internal class ProjectionFrames(
@@ -21,6 +23,8 @@ internal class ProjectionFrames(
     private val onResize: () -> Unit,
 ) : AutoCloseable {
     private val density = context.resources.configuration.densityDpi
+    private val handler = Handler(Looper.getMainLooper())
+    private val available = Channel<Unit>(Channel.CONFLATED)
     private var reader: ImageReader? = null
     private var display: VirtualDisplay? = null
     var generation = 0
@@ -31,7 +35,7 @@ internal class ProjectionFrames(
     }
 
     fun start(width: Int, height: Int) {
-        projection.registerCallback(callback, Handler(Looper.getMainLooper()))
+        projection.registerCallback(callback, handler)
         val input = newReader(width, height)
         reader = input
         display = checkNotNull(projection.createVirtualDisplay(
@@ -44,38 +48,66 @@ internal class ProjectionFrames(
         val old = reader ?: return
         val currentDisplay = display ?: return
         if (width < 1 || height < 1 || (old.width == width && old.height == height)) return
-        val input = newReader(width, height)
+        val input = try {
+            newReader(width, height)
+        } catch (error: RuntimeException) {
+            Diagnostics.failure("Размер кадра", "Не удалось подготовить поверхность захвата", error)
+            onStop()
+            return
+        }
         try {
             currentDisplay.setSurface(null)
             currentDisplay.resize(width, height, density)
             currentDisplay.setSurface(input.surface)
-        } catch (_: RuntimeException) {
+        } catch (error: RuntimeException) {
             input.close()
+            Diagnostics.failure("Размер кадра", "Не удалось изменить размер захвата", error)
             onStop()
             return
         }
         reader = input
-        old.close()
+        runCatching { old.close() }.onFailure { Diagnostics.failure("Кадры", "Не удалось закрыть прежнюю поверхность", it) }
         generation++
+        available.trySend(Unit)
         onResize()
     }
 
     private fun newReader(width: Int, height: Int): ImageReader =
-        ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3)
+        ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3).apply {
+            setOnImageAvailableListener({ available.trySend(Unit) }, handler)
+        }
+
+    fun discardQueued() {
+        reader?.acquireLatestImage()?.close()
+        available.tryReceive()
+    }
 
     suspend fun capture(hadVisibleBlocks: Boolean): Bitmap? {
         val input = reader ?: return null
-        if (hadVisibleBlocks) {
-            // Освобождаем буферы, накопившиеся до скрытия оверлея.
-            input.acquireLatestImage()?.close()
-            delay(55)
+        val hiddenAt = System.nanoTime()
+        if (hadVisibleBlocks) delay(72)
+        // Возвращаем Image только синхронно на main: resize и close работают на том же потоке.
+        var pending: Bitmap? = null
+        try {
+            val received = withTimeoutOrNull(if (hadVisibleBlocks) 430L else 1_450L) {
+                while (input === reader) {
+                    pending = input.acquireLatestImage()?.use { frame ->
+                        // На устройствах с монотонными отметками отбрасываем кадр до скрытия окна.
+                        val age = System.nanoTime() - frame.timestamp
+                        if (hadVisibleBlocks && age in 0..500_000_000L && frame.timestamp < hiddenAt) {
+                            null
+                        } else imageToBitmap(frame)
+                    }
+                    if (pending != null) return@withTimeoutOrNull true
+                    available.receive()
+                }
+                false
+            }
+            if (received != true) return null
+            return pending.also { pending = null }
+        } finally {
+            pending?.recycle()
         }
-        repeat(5) {
-            if (input !== reader) return null
-            input.acquireLatestImage()?.use { return imageToBitmap(it) }
-            delay(30)
-        }
-        return null
     }
 
     private fun imageToBitmap(image: Image): Bitmap {
@@ -98,8 +130,9 @@ internal class ProjectionFrames(
     }
 
     override fun close() {
-        runCatching { display?.release() }
-        runCatching { reader?.close() }
+        available.cancel()
+        runCatching { display?.release() }.onFailure { Diagnostics.failure("Захват", "Не удалось освободить экран", it) }
+        runCatching { reader?.close() }.onFailure { Diagnostics.failure("Захват", "Не удалось закрыть поток кадров", it) }
         reader = null
         display = null
         runCatching { projection.unregisterCallback(callback) }
